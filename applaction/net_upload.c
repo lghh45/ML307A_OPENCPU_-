@@ -13,7 +13,7 @@
 #include <string.h>
 
 
-#define UPLOAD_URL      "http://110.40.166.56:1113" //服务器地址
+#define UPLOAD_URL      "http://127.0.0.0:1" //服务器地址
 #define UPLOAD_PATH     "/api/sms/report"
 #define UPLOAD_USE_SSL  0 
 
