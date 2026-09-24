@@ -22,7 +22,7 @@ int cm_opencpu_entry(char *param)
 {
 	(void)param;
 
-	uart_open(CM_UART_DEV_0, CM_UART_BAUDRATE_115200, u0_callback);
+	//uart_open(CM_UART_DEV_0, CM_UART_BAUDRATE_115200, u0_callback);
 	u0_printf("\r\n===== SMS forwarder boot =====\r\n");
 
 	sms_queue_init();

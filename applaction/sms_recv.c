@@ -7,6 +7,7 @@
 #include "cm_modem.h"
 #include "cm_modem_info.h"
 #include "cm_pm.h"
+#include "cm_rtc.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdbool.h>
@@ -28,6 +29,26 @@
 #define SMS_CONCAT_MAX_PARTS   10
 #define SMS_PART_TEXT_MAX      256
 #define SMS_CONCAT_TIMEOUT_MS  30000
+
+/* eDRX：让模组按约定周期休眠，每个周期只在 PTW 窗口内监听寻呼，
+ * 空闲电流明显低于默认 DRX，代价是收短信的延迟约为周期的一半。
+ * 20.48 s 对应 LTE 的 eDRX 值 "0010"，实际周期由网络在 Attach / TAU
+ * 时批准，可用 AT+CEDRXS? 和 +CEDRXP 核对。
+ */
+#define EDRX_CFG_ENABLE  1
+#define EDRX_MODE        1       /* 1 仅开启，2 开启并上报 +CEDRXP */
+#define EDRX_ACT_TYPE    4       /* 4 = E-UTRAN(LTE) */
+#define EDRX_VALUE       "0010"  /* LTE: 0010 = 20.48 s */
+
+/* 来电检测：只上报"有没有人来电 + 主叫号码"，不接听。
+ * 该固件的 AT 层没有 ATA/CHUP，能用的只有 RING 和 +CLIP 两条 URC：
+ * 一通电话会先来 RING，+CLIP 带号码，之后每 3~5 秒重复 RING，
+ * 所以首声 RING 先开一个收集窗口，把两者凑齐后再入队。
+ */
+#define CALL_REPORT_ENABLE   1
+#define CALL_CLIP_WINDOW_MS  2000   /* 首声 RING 之后等 +CLIP 的收集窗口 */
+#define CALL_DEDUP_MS        60000  /* 同一通电话重复响铃的忽略时长 */
+#define CALL_CLIP_BUF_SIZE   96
 
 typedef struct
 {
@@ -65,6 +86,22 @@ static char         s_cmt_buf[AT_BUF_SIZE];
 static volatile int s_cmt_pending = 0;
 #define EVT_SMS_CMT   (1u << 0)
 #define EVT_CONCAT_TIMEOUT (1u << 1)
+
+#if CALL_REPORT_ENABLE
+static char         s_clip_buf[CALL_CLIP_BUF_SIZE];
+static volatile int s_clip_pending = 0;
+static volatile int s_ring_pending = 0;
+static uint32_t     s_clip_tick = 0;
+static bool         s_call_collecting = false;
+static uint32_t     s_call_window_tick = 0;
+static uint32_t     s_call_last_tick = 0;
+static bool         s_call_reported = false;
+#define EVT_CALL_RING  (1u << 2)
+#define EVT_CALL_CLIP  (1u << 3)
+#define EVT_WAIT_MASK  (EVT_SMS_CMT | EVT_CONCAT_TIMEOUT | EVT_CALL_RING | EVT_CALL_CLIP)
+#else
+#define EVT_WAIT_MASK  (EVT_SMS_CMT | EVT_CONCAT_TIMEOUT)
+#endif
 
 static sms_concat_t s_concat[SMS_CONCAT_MAX_GROUPS];
 static osTimerId_t  s_concat_timer = NULL;
@@ -216,6 +253,41 @@ static void urc_cb(char *urc)
     }
 
     log_text("[urc] ", urc);
+
+#if CALL_REPORT_ENABLE
+    /* 来电的两条 URC：+CLIP 带主叫号码，RING 表示有来电。
+     * 这里只拷贝和置位，解析和入队交给 sms_recv_task。
+     * 用 strstr 而不是 strncmp，是因为底层可能把几行 URC 一起交上来。
+     */
+    if (strstr(urc, "+CLIP:") != NULL)
+    {
+        size_t clip_len = strlen(urc);
+
+        if (clip_len >= sizeof(s_clip_buf))
+        {
+            clip_len = sizeof(s_clip_buf) - 1;
+        }
+        memcpy(s_clip_buf, urc, clip_len);
+        s_clip_buf[clip_len] = '\0';
+        s_clip_tick    = osKernelGetTickCount();
+        s_clip_pending = 1;
+
+        if (s_evt != NULL)
+        {
+            osEventFlagsSet(s_evt, EVT_CALL_CLIP);
+        }
+    }
+
+    if (strstr(urc, "RING") != NULL)
+    {
+        s_ring_pending = 1;
+
+        if (s_evt != NULL)
+        {
+            osEventFlagsSet(s_evt, EVT_CALL_RING);
+        }
+    }
+#endif
 
     if (strstr(urc, "+CMT:") == NULL)
     {
@@ -552,6 +624,134 @@ static void sms_handle_cmt(const char *raw)
     handle_decoded_sms(&item, ref_number, part_number, total_parts);
 }
 
+#if CALL_REPORT_ENABLE
+/* --------------------------------------------------------------------------
+ * 来电检测
+ * ------------------------------------------------------------------------ */
+
+/**
+ * @brief 从 +CLIP URC 里取出主叫号码
+ *
+ * @details 形如 +CLIP: "+8613800138000",145,,,,0，号码在引号里；
+ *          主叫隐藏号码时引号内为空，按未知号码处理。
+ */
+static void call_parse_clip(const char *urc, char *out, size_t out_size)
+{
+    const char *p;
+    size_t      n = 0;
+
+    if (out == NULL || out_size == 0)
+    {
+        return;
+    }
+    out[0] = '\0';
+
+    if (urc == NULL)
+    {
+        return;
+    }
+
+    p = strchr(urc, '"');
+    if (p == NULL)
+    {
+        return;
+    }
+
+    for (p = p + 1; *p != '\0' && *p != '"' && n < out_size - 1; p++)
+    {
+        out[n++] = *p;
+    }
+    out[n] = '\0';
+}
+
+static void call_push_item(const char *number)
+{
+    sms_item_t item;
+
+    memset(&item, 0, sizeof(item));
+    item.type = SMS_ITEM_TYPE_CALL;
+    copy_str(item.sender, sizeof(item.sender), (number != NULL) ? number : "");
+    /* 来电没有 SCTS，存检测时刻的 epoch 秒，避免离线排队后时间失真 */
+    snprintf(item.timestamp, sizeof(item.timestamp), "%llu",
+             (unsigned long long)cm_rtc_get_current_time());
+    copy_str(item.text, sizeof(item.text), "incoming call");
+
+    if (!sms_queue_push(&item))
+    {
+        u0_printf("[call] queue full, dropped\r\n");
+        return;
+    }
+
+    u0_printf("[call] queued seq=%u from=%s\r\n", (unsigned)item.seq,
+              (item.sender[0] != '\0') ? item.sender : "unknown");
+}
+
+/* 收集窗口还剩多少 tick 要等，已经到期返回 1 */
+static uint32_t call_window_ticks(void)
+{
+    uint32_t window  = osMsToTicks(CALL_CLIP_WINDOW_MS);
+    uint32_t elapsed = (uint32_t)(osKernelGetTickCount() - s_call_window_tick);
+
+    return (elapsed >= window) ? 1 : (window - elapsed);
+}
+
+/**
+ * @brief 收到一声 RING：判断这是不是新的一通电话
+ */
+static void call_handle_ring(void)
+{
+    uint32_t now = osKernelGetTickCount();
+
+    if (s_call_collecting)
+    {
+        return; /* 同一通电话的重复响铃 */
+    }
+
+    if (s_call_reported &&
+        (uint32_t)(now - s_call_last_tick) < osMsToTicks(CALL_DEDUP_MS))
+    {
+        return; /* 去重期内，按同一通电话处理 */
+    }
+
+    s_call_collecting  = true;
+    s_call_window_tick = now;
+
+    /* 号码比 RING 早到时留着的 +CLIP，超过一个窗口就丢掉 */
+    if (s_clip_pending &&
+        (uint32_t)(now - s_clip_tick) > osMsToTicks(CALL_CLIP_WINDOW_MS))
+    {
+        s_clip_pending = 0;
+    }
+}
+
+/**
+ * @brief 收集窗口到期：把这一通电话入队
+ */
+static void call_handle_window(void)
+{
+    char number[SMS_SENDER_MAX];
+
+    if ((uint32_t)(osKernelGetTickCount() - s_call_window_tick) <
+        osMsToTicks(CALL_CLIP_WINDOW_MS))
+    {
+        return; /* 还在等 +CLIP */
+    }
+
+    number[0] = '\0';
+    if (s_clip_pending)
+    {
+        call_parse_clip(s_clip_buf, number, sizeof(number));
+    }
+
+    s_call_collecting = false;
+    s_clip_pending    = 0;
+    s_call_reported   = true;
+    s_call_last_tick  = osKernelGetTickCount();
+
+    call_push_item(number);
+}
+#endif
+
 /* --------------------------------------------------------------------------
  * 线程
  * ------------------------------------------------------------------------ */
@@ -714,6 +914,34 @@ static void sms_debug_probe(void)
 
 #endif
 
+#if EDRX_CFG_ENABLE
+/**
+ * @brief 配置模组 eDRX 周期
+ *
+ * @details 3GPP 规定 <Requested_eDRX_value> 是带引号的字符串（如 "0010"），
+ *          个别固件也接受不带引号的写法，这里失败后回退一次。
+ *          命令下发的是"请求值"，最终周期由网络在 Attach / TAU 时决定。
+ */
+static void edrx_config(void)
+{
+    char cmd[40];
+    int  rc;
+
+    snprintf(cmd, sizeof(cmd), "AT+CEDRXS=%d,%d,\"%s\"",
+             EDRX_MODE, EDRX_ACT_TYPE, EDRX_VALUE);
+    rc = at_exec(cmd, s_resp, sizeof(s_resp));
+
+    if (rc != 0)
+    {
+        snprintf(cmd, sizeof(cmd), "AT+CEDRXS=%d,%d,%s",
+                 EDRX_MODE, EDRX_ACT_TYPE, EDRX_VALUE);
+        rc = at_exec(cmd, s_resp, sizeof(s_resp));
+    }
+
+    u0_printf("[sms] eDRX value %s -> %d\r\n", EDRX_VALUE, rc);
+}
+#endif
+
 void sms_recv_task(void *argument)
 {
 #if SMS_DEBUG_SCAN
@@ -738,6 +966,10 @@ void sms_recv_task(void *argument)
 
     cm_virt_at_urc_reg(urc_cb);
 
+#if EDRX_CFG_ENABLE
+    edrx_config();
+#endif
+
     rc = at_exec("AT+CMGF=0", s_resp, sizeof(s_resp));
     u0_printf("[sms] CMGF=0   -> %d\r\n", rc);
     if (rc != 0)
@@ -752,6 +984,16 @@ void sms_recv_task(void *argument)
         log_text("[sms]   raw: ", s_resp);
     }
 
+#if CALL_REPORT_ENABLE
+    /* 打开主叫号码显示，来电的 +CLIP URC 里才会带号码 */
+    rc = at_exec("AT+CLIP=1", s_resp, sizeof(s_resp));
+    u0_printf("[call] CLIP=1   -> %d\r\n", rc);
+    if (rc != 0)
+    {
+        log_text("[call]   raw: ", s_resp);
+    }
+#endif
+
 #if SMS_DEBUG_SCAN
     sms_debug_probe(); 
     sms_debug_scan();  
@@ -760,13 +1002,35 @@ void sms_recv_task(void *argument)
 
     for (;;)
     {
-        osEventFlagsWait(s_evt, EVT_SMS_CMT | EVT_CONCAT_TIMEOUT,
-                         osFlagsWaitAny, osWaitForever);
+        uint32_t wait_ticks = osWaitForever;
+
+#if CALL_REPORT_ENABLE
+        if (s_call_collecting)
+        {
+            wait_ticks = call_window_ticks();
+        }
+#endif
+
+        osEventFlagsWait(s_evt, EVT_WAIT_MASK, osFlagsWaitAny, wait_ticks);
+
         if (s_cmt_pending)
         {
             s_cmt_pending = 0;
             sms_handle_cmt(s_cmt_buf);
         }
+
+#if CALL_REPORT_ENABLE
+        if (s_ring_pending)
+        {
+            s_ring_pending = 0;
+            call_handle_ring();
+        }
+
+        if (s_call_collecting)
+        {
+            call_handle_window();
+        }
+#endif
 
         concat_expire();
         concat_timer_rearm();

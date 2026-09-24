@@ -1,8 +1,10 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -23,6 +25,12 @@
 #define SERVER_IP "0.0.0.0"
 #define EPOLL_SIZE 1024
 #define RECV_BUFFER_SIZE 4096
+#define app_Token ""
+#define wx_UID ""
+#define WX_HOST ""
+#define WX_PORT "80"
+#define WX_PATH "/api/send/message"
+#define WX_TIMEOUT_SEC 5
 
 namespace {
 void addfd(int epfd, int fd, bool enable_et)
@@ -289,23 +297,6 @@ bool try_parse_request(const std::string &buffer, HttpRequest *req, bool *bad_re
     return true;
 }
 
-void log_request(const HttpRequest &req, bool bad_request)
-{
-    if (bad_request) {
-        printf("bad request line\n");
-        fflush(stdout);
-        return;
-    }
-    printf("--- %s\n", req.path.c_str());
-    std::string pretty;
-    if (pretty_json(req.body, &pretty)) {
-        printf("%s\n", pretty.c_str());
-    } else {
-        printf("not json: parse error | %s\n", req.body.c_str());
-    }
-    fflush(stdout);
-}
-
 void send_all(int fd, const std::string &data)
 {
     size_t sent = 0;
@@ -319,6 +310,159 @@ void send_all(int fd, const std::string &data)
             break;  // 对端已经断开
         }
     }
+}
+
+std::string json_escape(const std::string &text)
+{
+    std::string out;
+    out.reserve(text.size() + text.size() / 8 + 16);
+    for (char ch : text) {
+        unsigned char c = static_cast<unsigned char>(ch);
+        if (c == '"') {
+            out += "\\\"";
+        } else if (c == '\\') {
+            out += "\\\\";
+        } else if (c == '\n') {
+            out += "\\n";
+        } else if (c == '\r') {
+            out += "\\r";
+        } else if (c == '\t') {
+            out += "\\t";
+        } else if (c == '\b') {
+            out += "\\b";
+        } else if (c == '\f') {
+            out += "\\f";
+        } else if (c < 0x20 || c == 0x7f) {
+            char escape[8];
+            snprintf(escape, sizeof(escape), "\\u%04x", c);
+            out += escape;
+        } else {
+            out += ch;  
+        }
+    }
+    return out;
+}
+
+// 从响应里取出 wxpusher 的 code 字段，取不到返回 -1。
+int parse_wxpusher_code(const std::string &response)
+{
+    size_t pos = response.find("\"code\"");
+    if (pos == std::string::npos) {
+        return -1;
+    }
+    pos += sizeof("\"code\"") - 1;
+    while (pos < response.size() &&
+           (response[pos] == ':' || response[pos] == ' ' || response[pos] == '\t')) {
+        ++pos;
+    }
+    size_t begin = pos;
+    while (pos < response.size() && std::isdigit(static_cast<unsigned char>(response[pos])) != 0) {
+        ++pos;
+    }
+    if (pos == begin) {
+        return -1;
+    }
+    return atoi(response.substr(begin, pos - begin).c_str());
+}
+
+// 把 content 作为 JSON 文本 POST 到 wxpusher，返回 wxpusher 是否接收成功。
+bool send_wxpusher(const std::string &content)
+{
+    std::string body;
+    body = "{\"appToken\":\"" app_Token "\",\"content\":\"";
+    body += json_escape(content);
+    body += "\",\"summary\":\"短信转发\",\"contentType\":1,\"uids\":[\"" wx_UID "\"]}";
+
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    struct addrinfo *addrs = nullptr;
+    int gai = getaddrinfo(WX_HOST, WX_PORT, &hints, &addrs);
+    if (gai != 0) {
+        printf("wxpusher: resolve %s failed: %s\n", WX_HOST, gai_strerror(gai));
+        fflush(stdout);
+        return false;
+    }
+
+    bool ok = false;
+    for (struct addrinfo *ai = addrs; ai != nullptr; ai = ai->ai_next) {
+        int fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (fd < 0) {
+            continue;
+        }
+        struct timeval timeout;
+        timeout.tv_sec = WX_TIMEOUT_SEC;
+        timeout.tv_usec = 0;
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+        if (connect(fd, ai->ai_addr, ai->ai_addrlen) < 0) {
+            printf("wxpusher: connect failed: %s\n", strerror(errno));
+            fflush(stdout);
+            close(fd);
+            continue;
+        }
+
+        // wxpusher 是纯 HTTP 接口，body 是 UTF-8 JSON，长度按字节数算。
+        std::string request;
+        request += "POST " WX_PATH " HTTP/1.1\r\n";
+        request += "Host: " WX_HOST "\r\n";
+        request += "Content-Type: application/json\r\n";
+        request += "Content-Length: " + std::to_string(body.size()) + "\r\n";
+        request += "Connection: close\r\n\r\n";
+        request += body;
+        send_all(fd, request);
+
+        std::string response;
+        char chunk[1024];
+        while (true) {
+            ssize_t count = recv(fd, chunk, sizeof(chunk), 0);
+            if (count > 0) {
+                response.append(chunk, static_cast<size_t>(count));
+            } else if (count < 0 && errno == EINTR) {
+                continue;
+            } else {
+                break;  // 0 表示对端读完就关；<0 表示出错或超时
+            }
+        }
+        close(fd);
+
+        int code = parse_wxpusher_code(response);
+        if (code == 1000) {
+            printf("wxpusher: 推送成功\n");
+            ok = true;
+        } else {
+            std::string brief = response.substr(0, 200);
+            for (char &ch : brief) {
+                if (static_cast<unsigned char>(ch) < 0x20) {
+                    ch = ' ';
+                }
+            }
+            printf("wxpusher: 推送失败, code=%d | %s\n", code, brief.c_str());
+        }
+        fflush(stdout);
+        break;  
+    }
+    freeaddrinfo(addrs);
+    return ok;
+}
+
+void log_request(const HttpRequest &req, bool bad_request)
+{
+    if (bad_request) {
+        printf("bad request line\n");
+        fflush(stdout);
+        return;
+    }
+    printf("--- %s\n", req.path.c_str());
+    std::string pretty;
+    if (pretty_json(req.body, &pretty)) {
+        printf("%s\n", pretty.c_str());
+        send_wxpusher(pretty);
+    } else {
+        printf("not json: parse error | %s\n", req.body.c_str());
+    }
+    fflush(stdout);
 }
 
 void send_response(int fd, const char *status, const std::string &body)

@@ -11,9 +11,10 @@
 #include "cJSON.h"
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 
 
-#define UPLOAD_URL      "http://127.0.0.0:1" //服务器地址
+#define UPLOAD_URL      "http://110.40.166.56:1113" //服务器地址
 #define UPLOAD_PATH     "/api/sms/report"
 #define UPLOAD_USE_SSL  0 
 
@@ -170,6 +171,9 @@ int net_upload_post(const sms_item_t *item)
     }
 
     snprintf(msg_id, sizeof(msg_id), "%s-%08u", s_imei, (unsigned)item->seq);
+    u0_printf("[up] post %s seq=%u\r\n",
+              (item->type == SMS_ITEM_TYPE_CALL) ? "call" : "sms",
+              (unsigned)item->seq);
 
     root = cJSON_CreateObject();
     if (root == NULL)
@@ -179,10 +183,26 @@ int net_upload_post(const sms_item_t *item)
     cJSON_AddStringToObject(root, "msg_id", msg_id);
     cJSON_AddStringToObject(root, "imei", s_imei);
     cJSON_AddStringToObject(root, "imsi", s_imsi);
-    cJSON_AddStringToObject(root, "sender", item->sender);
-    cJSON_AddStringToObject(root, "scts", item->timestamp);
+
+    if (item->type == SMS_ITEM_TYPE_CALL)
+    {
+        /* 来电：caller 为空串表示主叫号码未知（主叫隐藏或没收到 +CLIP），
+         * call_ts 是检测到来电的时刻（epoch 秒），由队列里的 timestamp 带过来。
+         */
+        cJSON_AddStringToObject(root, "type", "call");
+        cJSON_AddStringToObject(root, "caller", item->sender);
+        cJSON_AddNumberToObject(root, "call_ts",
+                                (double)strtoull(item->timestamp, NULL, 10));
+    }
+    else
+    {
+        cJSON_AddStringToObject(root, "type", "sms");
+        cJSON_AddStringToObject(root, "sender", item->sender);
+        cJSON_AddStringToObject(root, "scts", item->timestamp);
+        cJSON_AddStringToObject(root, "content", item->text);
+    }
+
     cJSON_AddNumberToObject(root, "ts", (double)cm_rtc_get_current_time());
-    cJSON_AddStringToObject(root, "content", item->text);
 
     body = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
