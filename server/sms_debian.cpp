@@ -21,7 +21,7 @@
 #include <unordered_map>
 #include <utility>
 
-#define SERVER_PORT 1113
+#define SERVER_PORT 5656
 #define SERVER_IP "0.0.0.0"
 #define EPOLL_SIZE 1024
 #define RECV_BUFFER_SIZE 4096
